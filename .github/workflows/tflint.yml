@@ -25,7 +25,8 @@ permissions:
 env:
   TFLINT_VERSION: ${{ inputs.tflint_version || 'latest' }}
   FAIL_ON_ISSUES: ${{ github.event_name != 'workflow_dispatch' || inputs.fail_on_issues }}
-  TF_ROOT: terraform
+  TF_ROOT: "."                      # folder to lint (relative to repo root); "." = whole repo, recursively
+  TFLINT_CONFIG: .tflint.hcl        # path relative to repo root
   REPORT_DIR: ${{ github.workspace }}/tflint-reports
 
 jobs:
@@ -33,6 +34,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Preflight - check config and Terraform folder
+        run: |
+          ok=1
+          if [ ! -f "$TFLINT_CONFIG" ]; then
+            echo "::error::TFLint config not found: $TFLINT_CONFIG"
+            echo "Files that look like a TFLint config:"; find . -path ./.git -prune -o -iname '*tflint*' -print
+            ok=0
+          fi
+          if [ ! -d "$TF_ROOT" ]; then
+            echo "::error::TF_ROOT folder not found: $TF_ROOT"
+            ok=0
+          fi
+          echo "Terraform (.tf) files in this repo:"
+          find . -path ./.git -prune -o -name '*.tf' -print | sort || true
+          [ "$ok" = 1 ] || exit 1
+          [ -n "$(find "$TF_ROOT" -name '*.tf' -not -path '*/.terraform/*' | head -1)" ] \
+            || echo "::warning::No .tf files under $TF_ROOT - nothing to lint"
 
       # ---------- 1. Resolve version ----------
       - name: Resolve TFLint version
@@ -97,7 +116,7 @@ jobs:
       - name: Install plugins (tflint --init)
         env:
           GITHUB_TOKEN: ${{ github.token }}   # avoids GitHub API rate limits when fetching plugins
-        run: tflint --init --config "$GITHUB_WORKSPACE/.tflint.hcl"
+        run: tflint --init --config "$GITHUB_WORKSPACE/$TFLINT_CONFIG"
 
       # ---------- 6. Lint ----------
       - name: Run TFLint
@@ -106,7 +125,7 @@ jobs:
         run: |
           set -uo pipefail
           mkdir -p "$REPORT_DIR"
-          CFG="$GITHUB_WORKSPACE/.tflint.hcl"   # absolute path is required with --recursive
+          CFG="$GITHUB_WORKSPACE/$TFLINT_CONFIG"   # absolute path is required with --recursive
 
           # Human-readable run; this one decides pass/fail.
           # Exit codes: 0 = no issues, 1 = TFLint error, 2 = issues found
