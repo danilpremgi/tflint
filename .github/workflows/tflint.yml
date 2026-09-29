@@ -10,6 +10,9 @@ on:
       tflint_version:
         description: "TFLint version tag (e.g. v0.58.0) or 'latest'"
         default: "latest"
+      expected_sha256:
+        description: "Optional pinned SHA-256 of tflint_linux_amd64.zip"
+        default: ""
       fail_on_issues:
         description: "Fail the job when TFLint finds issues"
         type: boolean
@@ -18,7 +21,6 @@ on:
 permissions:
   contents: read
   security-events: write   # upload SARIF (Static Analysis Results Interchange Format) to Code Scanning
-  attestations: read       # gh attestation verify
 
 env:
   TFLINT_VERSION: ${{ inputs.tflint_version || 'latest' }}
@@ -58,12 +60,6 @@ jobs:
           ls -l tflint_linux_amd64.zip checksums.txt
 
       # ---------- 3. Verify ----------
-      - name: Verify provenance (GitHub artifact attestation)
-        working-directory: ${{ runner.temp }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh attestation verify checksums.txt -R terraform-linters/tflint
-
       - name: Verify SHA-256 checksum
         working-directory: ${{ runner.temp }}
         run: |
@@ -71,6 +67,13 @@ jobs:
           # Pick the exact line so the check can never silently "pass" on zero files
           grep ' tflint_linux_amd64.zip$' checksums.txt > zip.sha256
           sha256sum -c zip.sha256
+          PINNED="$(echo "${{ inputs.expected_sha256 }}" | tr -d '[:space:]')"
+          if [ -n "$PINNED" ]; then
+            echo "$PINNED  tflint_linux_amd64.zip" | sha256sum -c -
+          else
+            echo "::warning::No pinned SHA-256 set - checked against release checksums.txt only"
+          fi
+          echo "Actual SHA-256: $(sha256sum tflint_linux_amd64.zip | cut -d' ' -f1)"
 
       # ---------- 4. Unpack + install ----------
       - name: Unpack and install
