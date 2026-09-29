@@ -123,6 +123,7 @@ jobs:
         id: lint
         working-directory: ${{ env.TF_ROOT }}
         run: |
+          set +e            # the runner starts bash with -e; turn it off so we can capture TFLint's exit code ourselves
           set -uo pipefail
           mkdir -p "$REPORT_DIR"
           CFG="$GITHUB_WORKSPACE/$TFLINT_CONFIG"   # absolute path is required with --recursive
