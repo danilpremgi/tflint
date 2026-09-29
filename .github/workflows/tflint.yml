@@ -1,0 +1,153 @@
+name: TFLint (manual install test)
+
+on:
+  push:
+    paths: ["**/*.tf", ".tflint.hcl", ".github/workflows/tflint.yml"]
+  pull_request:
+    paths: ["**/*.tf", ".tflint.hcl", ".github/workflows/tflint.yml"]
+  workflow_dispatch:
+    inputs:
+      tflint_version:
+        description: "TFLint version tag (e.g. v0.58.0) or 'latest'"
+        default: "latest"
+      fail_on_issues:
+        description: "Fail the job when TFLint finds issues"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  security-events: write   # upload SARIF (Static Analysis Results Interchange Format) to Code Scanning
+  attestations: read       # gh attestation verify
+
+env:
+  TFLINT_VERSION: ${{ inputs.tflint_version || 'latest' }}
+  FAIL_ON_ISSUES: ${{ github.event_name != 'workflow_dispatch' || inputs.fail_on_issues }}
+  TF_ROOT: terraform
+  REPORT_DIR: ${{ github.workspace }}/tflint-reports
+
+jobs:
+  tflint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---------- 1. Resolve version ----------
+      - name: Resolve TFLint version
+        id: ver
+        run: |
+          set -euo pipefail
+          if [ "$TFLINT_VERSION" = "latest" ]; then
+            # Follow the /releases/latest redirect - no API call, so no rate limit / token needed
+            url=$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/terraform-linters/tflint/releases/latest)
+            TFLINT_VERSION="${url##*/}"
+          fi
+          echo "version=$TFLINT_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Using TFLint $TFLINT_VERSION"
+
+      # ---------- 2. Download ----------
+      - name: Download release + checksums
+        working-directory: ${{ runner.temp }}
+        env:
+          V: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          base="https://github.com/terraform-linters/tflint/releases/download/$V"
+          curl -fsSLO "$base/tflint_linux_amd64.zip"
+          curl -fsSLO "$base/checksums.txt"
+          ls -l tflint_linux_amd64.zip checksums.txt
+
+      # ---------- 3. Verify ----------
+      - name: Verify provenance (GitHub artifact attestation)
+        working-directory: ${{ runner.temp }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh attestation verify checksums.txt -R terraform-linters/tflint
+
+      - name: Verify SHA-256 checksum
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          # Pick the exact line so the check can never silently "pass" on zero files
+          grep ' tflint_linux_amd64.zip$' checksums.txt > zip.sha256
+          sha256sum -c zip.sha256
+
+      # ---------- 4. Unpack + install ----------
+      - name: Unpack and install
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          unzip -o tflint_linux_amd64.zip -d tflint-extract
+          install -D -m 0755 tflint-extract/tflint "$RUNNER_TEMP/tflint-bin/tflint"
+          echo "$RUNNER_TEMP/tflint-bin" >> "$GITHUB_PATH"
+
+      - name: Show version
+        run: tflint --version
+
+      # ---------- 5. Plugins ----------
+      - name: Cache TFLint plugins
+        uses: actions/cache@v4
+        with:
+          path: ~/.tflint.d/plugins
+          key: tflint-plugins-${{ runner.os }}-${{ hashFiles('.tflint.hcl') }}
+
+      - name: Install plugins (tflint --init)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}   # avoids GitHub API rate limits when fetching plugins
+        run: tflint --init --config "$GITHUB_WORKSPACE/.tflint.hcl"
+
+      # ---------- 6. Lint ----------
+      - name: Run TFLint
+        id: lint
+        working-directory: ${{ env.TF_ROOT }}
+        run: |
+          set -uo pipefail
+          mkdir -p "$REPORT_DIR"
+          CFG="$GITHUB_WORKSPACE/.tflint.hcl"   # absolute path is required with --recursive
+
+          # Human-readable run; this one decides pass/fail.
+          # Exit codes: 0 = no issues, 1 = TFLint error, 2 = issues found
+          tflint --recursive --config "$CFG" --format compact --no-color | tee "$REPORT_DIR/tflint.txt"
+          rc=${PIPESTATUS[0]}
+
+          # Machine-readable reports (--force = always exit 0)
+          tflint --recursive --config "$CFG" --format junit --force > "$REPORT_DIR/tflint-junit.xml"
+          tflint --recursive --config "$CFG" --format sarif --force > "$REPORT_DIR/tflint.sarif"
+
+          echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
+          echo "TFLint exit code: $rc"
+          [ "$rc" -eq 1 ] && { echo "::error::TFLint itself failed (exit 1)"; exit 1; }
+          exit 0
+
+      # ---------- 7. Report ----------
+      - name: Write job summary
+        if: always()
+        run: |
+          {
+            echo "## TFLint ${{ steps.ver.outputs.version }}"
+            echo "Exit code: \`${{ steps.lint.outputs.exit_code }}\` (0 = clean, 2 = issues)"
+            echo '```'
+            cat "$REPORT_DIR/tflint.txt" 2>/dev/null || echo "no output"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload reports as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tflint-reports
+          path: ${{ env.REPORT_DIR }}
+
+      - name: Upload SARIF to Code Scanning
+        if: always()
+        continue-on-error: true   # private repos need GitHub Advanced Security for this
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: ${{ env.REPORT_DIR }}/tflint.sarif
+          category: tflint
+
+      - name: Fail if issues were found
+        if: steps.lint.outputs.exit_code == '2' && env.FAIL_ON_ISSUES == 'true'
+        run: |
+          echo "::error::TFLint found issues - see job summary / tflint-reports artifact"
+          exit 1
